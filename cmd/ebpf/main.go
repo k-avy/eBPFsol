@@ -1,77 +1,72 @@
 package main
 
 import (
-    "fmt"
-    "os"
-    "strconv"
-    "github.com/cilium/ebpf"
-    "github.com/cilium/ebpf/link"
-    "github.com/cilium/ebpf/rlimit"
+	"fmt"
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
+	"log"
+	"net"
+	"os"
+	"os/signal"
 )
 
 const (
-    bpfFile  = "drop_tcp_port.o"
-    mapName  = "port_map"
-    progName = "drop_tcp_port"
-    defaultPort = 4040
+	// Default port to drop to
+	defaultPort = 4040
 )
 
 func main() {
-    if len(os.Args) < 2 {
-        fmt.Printf("Usage: %s <port>\n", os.Args[0])
-        fmt.Printf("Using default port: %d\n", defaultPort)
-    }
+	// Remove resource limits for kernels <5.11.
+	if err := rlimit.RemoveMemlock(); err != nil {
+		log.Fatal("Removing memlock:", err)
+	}
 
-    port := defaultPort
-    if len(os.Args) > 1 {
-        var err error
-        port, err = strconv.Atoi(os.Args[1])
-        if err != nil {
-            fmt.Printf("Invalid port number: %s\n", os.Args[1])
-            return
-        }
-    }
+	// Load the compiled eBPF ELF and load it into the kernel.
+	var objs drop_tcp_portObjects
+	if err := loadDrop_tcp_portObjects(&objs, nil); err != nil {
+		log.Fatal("Loading eBPF objects:", err)
+	}
+	defer objs.Close()
 
-    if err := rlimit.RemoveMemlock(); err != nil {
-        fmt.Fprintf(os.Stderr, "failed to remove memlock: %v\n", err)
-        os.Exit(1)
-    }
+	ifname := "lo" // Change this to an interface on your machine.
+	iface, err := net.InterfaceByName(ifname)
+	if err != nil {
+		log.Fatalf("Getting interface %s: %s", ifname, err)
+	}
 
-    spec, err := ebpf.LoadCollectionSpec(bpfFile)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "failed to load BPF spec: %v\n", err)
-        os.Exit(1)
-    }
+	// Attach drop_tcp_packets to the network interface.
+	xdpLink, err := link.AttachXDP(link.XDPOptions{
+		Program:   objs.DropTcpPackets,
+		Interface: iface.Index,
+	})
+	if err != nil {
+		log.Fatal("Attaching XDP:", err)
+	}
+	defer xdpLink.Close()
 
-    objs := struct {
-        PortMap *ebpf.Map `ebpf:"port_map"`
-        Program *ebpf.Program `ebpf:"drop_tcp_port"`
-    }{}
+	log.Printf("Dropping TCP packets on port %d on %s..", defaultPort, ifname)
 
-    if err := spec.LoadAndAssign(&objs, nil); err != nil {
-        fmt.Fprintf(os.Stderr, "failed to load BPF objects: %v\n", err)
-        os.Exit(1)
-    }
-    defer objs.PortMap.Close()
-    defer objs.Program.Close()
+	// Update the port number in the drop_port map
+	port := defaultPort
+	if len(os.Args) > 1 {
+		var portArg int
+		if _, err := fmt.Sscanf(os.Args[1], "%d", &portArg); err == nil {
+			port = portArg
+		}
+	}
 
-    var key uint32 = 0
-    var value uint16 = uint16(port)
-    if err := objs.PortMap.Put(key, value); err != nil {
-        fmt.Fprintf(os.Stderr, "failed to update map: %v\n", err)
-        os.Exit(1)
-    }
+	key := uint32(0)
+	value := uint16(port)
+	if err := objs.DropPort.Update(&key, &value, ebpf.UpdateAny); err != nil {
+		log.Fatal("Updating drop_port map:", err)
+	}
 
-    link, err := link.AttachXDP(link.XDPOptions{
-        Program:   objs.Program,
-        Interface: 0,
-    })
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "failed to attach XDP program: %v\n", err)
-        os.Exit(1)
-    }
-    defer link.Close()
+	log.Printf("Configured to drop TCP packets on port %d", port)
 
-    fmt.Printf("eBPF program loaded and attached. Dropping TCP packets on port %d\n", port)
-    select {}
+	// Periodically check for program interruption
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt)
+	<-stop
+    log.Print("Received signal, exiting..")
 }
